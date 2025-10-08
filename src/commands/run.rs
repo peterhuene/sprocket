@@ -265,7 +265,11 @@ struct State {
 }
 
 /// Displays evaluation progress.
-async fn progress(mut events: broadcast::Receiver<Event>, pb: tracing::Span) {
+async fn progress(
+    mut events: broadcast::Receiver<Event>,
+    pb: tracing::Span,
+    token: CancellationToken,
+) {
     /// Helper for formatting the progress bar
     fn message(state: &State) -> String {
         let executing = state.executing.len();
@@ -294,50 +298,54 @@ async fn progress(mut events: broadcast::Receiver<Event>, pb: tracing::Span) {
     pb.pb_start();
 
     loop {
-        match events.recv().await {
-            Ok(event) if !lagged => {
-                let message = match event {
-                    Event::TaskCreated { id, name, .. } => {
-                        state.tasks.insert(id, name.into());
-                        message(&state)
-                    }
-                    Event::TaskStarted { id } => {
-                        if let Some(name) = state.tasks.get(&id).cloned() {
-                            state.executing.insert(name);
+        select! {
+            biased;
+            _ = token.cancelled() => break,
+            event = events.recv() => match event {
+                Ok(event) if !lagged => {
+                    let message = match event {
+                        Event::TaskCreated { id, name, .. } => {
+                            state.tasks.insert(id, name.into());
+                            message(&state)
                         }
-                        message(&state)
-                    }
-                    Event::TaskCompleted { id, .. } => {
-                        if let Some(name) = state.tasks.remove(&id) {
-                            state.executing.swap_remove(&name);
+                        Event::TaskStarted { id } => {
+                            if let Some(name) = state.tasks.get(&id).cloned() {
+                                state.executing.insert(name);
+                            }
+                            message(&state)
                         }
-                        state.completed += 1;
-                        message(&state)
-                    }
-                    Event::TaskFailed { id, .. } => {
-                        if let Some(name) = state.tasks.remove(&id) {
-                            state.executing.swap_remove(&name);
+                        Event::TaskCompleted { id, .. } => {
+                            if let Some(name) = state.tasks.remove(&id) {
+                                state.executing.swap_remove(&name);
+                            }
+                            state.completed += 1;
+                            message(&state)
                         }
-                        state.failed += 1;
-                        message(&state)
-                    }
-                    Event::TaskCanceled { id } | Event::TaskPreempted { id } => {
-                        if let Some(name) = state.tasks.remove(&id) {
-                            state.executing.swap_remove(&name);
+                        Event::TaskFailed { id, .. } => {
+                            if let Some(name) = state.tasks.remove(&id) {
+                                state.executing.swap_remove(&name);
+                            }
+                            state.failed += 1;
+                            message(&state)
                         }
-                        state.failed += 1;
-                        message(&state)
-                    }
-                    _ => continue,
-                };
+                        Event::TaskCanceled { id } | Event::TaskPreempted { id } => {
+                            if let Some(name) = state.tasks.remove(&id) {
+                                state.executing.swap_remove(&name);
+                            }
+                            state.failed += 1;
+                            message(&state)
+                        }
+                        _ => continue,
+                    };
 
-                pb.pb_set_message(&message);
-            }
-            Ok(_) => continue,
-            Err(RecvError::Closed) => break,
-            Err(RecvError::Lagged(_)) => {
-                lagged = true;
-                pb.pb_set_message(" - evaluation progress is unavailable due to missed events");
+                    pb.pb_set_message(&message);
+                }
+                Ok(_) => continue,
+                Err(RecvError::Closed) => break,
+                Err(RecvError::Lagged(_)) => {
+                    lagged = true;
+                    pb.pb_set_message(" - evaluation progress is unavailable due to missed events");
+                }
             }
         }
     }
@@ -557,19 +565,20 @@ pub async fn run(args: Args) -> Result<()> {
         .unwrap(),
     );
 
-    let token = CancellationToken::new();
+    let events_token = CancellationToken::new();
     let events = Events::all(EVENTS_CHANNEL_CAPACITY);
     let transfer_progress = tokio::spawn(cloud_copy::cli::handle_events(
         events
             .subscribe_transfer()
             .expect("should have transfer events"),
-        token.clone(),
+        events_token.clone(),
     ));
     let crankshaft_progress = tokio::spawn(progress(
         events
             .subscribe_crankshaft()
             .expect("should have Crankshaft events"),
         span,
+        events_token.clone(),
     ));
 
     let evaluator = Evaluator::new(
@@ -581,7 +590,8 @@ pub async fn run(args: Args) -> Result<()> {
         &output_dir,
     );
 
-    let mut evaluate = evaluator.run(token.clone(), events).boxed();
+    let evaluation_token = CancellationToken::new();
+    let mut evaluate = evaluator.run(evaluation_token.clone(), events).boxed();
 
     select! {
         // Always prefer the CTRL-C signal to the evaluation returning.
@@ -589,13 +599,15 @@ pub async fn run(args: Args) -> Result<()> {
 
         _ = tokio::signal::ctrl_c() => {
             error!("execution was interrupted: waiting for evaluation to abort");
-            token.cancel();
+            evaluation_token.cancel();
             let _ = evaluate.await;
+            events_token.cancel();
             let _ = transfer_progress.await;
             let _ = crankshaft_progress.await;
             bail!("execution was aborted");
         },
         res = &mut evaluate => {
+            events_token.cancel();
             let _ = transfer_progress.await;
             let _ = crankshaft_progress.await;
 

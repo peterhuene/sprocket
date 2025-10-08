@@ -1392,10 +1392,6 @@ impl WorkflowEvaluator {
 
         let mut gathers: HashMap<_, Gather> = HashMap::new();
         for (i, value) in array.iter().enumerate() {
-            if state.token.is_cancelled() {
-                return Err(anyhow!("workflow evaluation has been cancelled").into());
-            }
-
             // Allocate a scope
             let scope = {
                 let mut scopes = state.scopes.write().await;

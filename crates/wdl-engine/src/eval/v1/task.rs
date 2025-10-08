@@ -1026,7 +1026,9 @@ impl TaskEvaluator {
                         state.document.clone(),
                         task_execution_failed(e, task.name(), id, task.name_span()),
                     )
-                })?;
+                });
+
+            let result = result?;
 
             // Update the task variable
             let evaluated = EvaluatedTask::new(attempt_dir, result)?;
