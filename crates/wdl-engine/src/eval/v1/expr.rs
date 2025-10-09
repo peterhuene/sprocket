@@ -1595,6 +1595,10 @@ pub(crate) mod test {
         fn apply_auth<'a>(&self, url: &'a Url) -> anyhow::Result<Cow<'a, Url>> {
             Ok(Cow::Borrowed(url))
         }
+
+        fn walk<'a>(&'a self, _: &'a Url) -> BoxFuture<'a, Result<Vec<String>>> {
+            unimplemented!()
+        }
     }
 
     /// Represents test evaluation context to an expression evaluator.

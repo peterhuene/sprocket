@@ -94,6 +94,13 @@ pub trait Transferer: Send + Sync {
     ///
     /// If the provided URL does not need to be modified, it is returned as-is.
     fn apply_auth<'a>(&self, url: &'a Url) -> Result<Cow<'a, Url>>;
+
+    /// Walks a given storage URL as if it were a directory.
+    ///
+    /// Returns a list of relative paths from the given URL.
+    ///
+    /// If the given storage URL is not a directory, an empty list is returned.
+    fn walk<'a>(&'a self, url: &'a Url) -> BoxFuture<'a, Result<Vec<String>>>;
 }
 
 /// Represents the internal state of `HttpTransferer`.
@@ -427,5 +434,18 @@ impl Transferer for HttpTransferer {
         }
 
         Ok(url)
+    }
+
+    fn walk<'a>(&'a self, url: &'a Url) -> BoxFuture<'a, Result<Vec<String>>> {
+        async move {
+            cloud_copy::walk(
+                self.0.copy_config.clone(),
+                self.0.client.clone(),
+                url.clone(),
+            )
+            .await
+            .with_context(|| format!("failed to walk URL `{url}`"))
+        }
+        .boxed()
     }
 }
