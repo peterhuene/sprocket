@@ -20,14 +20,14 @@ use tracing::info;
 use url::Url;
 
 use crate::ContentKind;
-use crate::Input;
+use crate::EvaluationPath;
 use crate::PrimitiveValue;
 use crate::Value;
+use crate::backend::Input;
 use crate::backend::TaskExecutionResult;
 use crate::cache::hash::hash_sequence;
 use crate::cache::lock::LockedFile;
 use crate::http::Transferer;
-use crate::path::EvaluationPath;
 
 /// The current cache entry version.
 ///
@@ -552,7 +552,7 @@ mod test {
                 )]),
                 backend_inputs: [Input::new(
                     ContentKind::File,
-                    EvaluationPath::Local(input),
+                    EvaluationPath::from_local_path(input),
                     Some(GuestPath::new("/mnt/task/0/input")),
                 )],
             }
@@ -630,7 +630,7 @@ mod test {
         // Cache an execution result
         let result = TaskExecutionResult {
             exit_code: 0,
-            work_dir: EvaluationPath::Local(task.paths.work_dir.clone()),
+            work_dir: EvaluationPath::from_local_path(task.paths.work_dir.clone()),
             stdout: PrimitiveValue::new_file(task.paths.stdout.to_str().unwrap()).into(),
             stderr: PrimitiveValue::new_file(task.paths.stderr.to_str().unwrap()).into(),
         };
@@ -932,7 +932,7 @@ mod test {
                     ctx.task.backend_inputs[0].clone(),
                     Input::new(
                         ContentKind::File,
-                        EvaluationPath::Local(input2.clone()),
+                        EvaluationPath::from_local_path(input2.clone()),
                         Some(GuestPath::new("/mnt/task/0/input2")),
                     ),
                 ],

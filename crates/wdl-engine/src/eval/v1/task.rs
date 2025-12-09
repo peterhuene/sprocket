@@ -68,7 +68,7 @@ use wdl_ast::v1::TaskDefinition;
 use wdl_ast::v1::TaskHintsSection;
 use wdl_ast::version::V1;
 
-use super::TopLevelEvaluator;
+use super::Evaluator;
 use super::validators::SettingSource;
 use super::validators::ensure_non_negative_i64;
 use super::validators::invalid_numeric_value_message;
@@ -78,23 +78,21 @@ use crate::ContentKind;
 use crate::EngineEvent;
 use crate::EvaluationContext;
 use crate::EvaluationError;
+use crate::EvaluationPath;
 use crate::EvaluationResult;
 use crate::GuestPath;
 use crate::HiddenValue;
 use crate::HostPath;
-use crate::Input;
 use crate::ONE_GIBIBYTE;
 use crate::Object;
 use crate::Outputs;
-use crate::Scope;
-use crate::ScopeIndex;
-use crate::ScopeRef;
 use crate::StorageUnit;
 use crate::TaskInputs;
 use crate::TaskPostEvaluationData;
 use crate::TaskPostEvaluationValue;
 use crate::TaskPreEvaluationValue;
 use crate::Value;
+use crate::backend::Input;
 use crate::backend::TaskSpawnInfo;
 use crate::backend::TaskSpawnRequest;
 use crate::cache::KeyRequest;
@@ -108,9 +106,11 @@ use crate::diagnostics::runtime_type_mismatch;
 use crate::diagnostics::task_execution_failed;
 use crate::diagnostics::task_localization_failed;
 use crate::eval::EvaluatedTask;
+use crate::eval::Scope;
+use crate::eval::ScopeIndex;
+use crate::eval::ScopeRef;
 use crate::eval::trie::InputTrie;
 use crate::http::Transferer;
-use crate::path::EvaluationPath;
 use crate::path::is_file_url;
 use crate::path::is_supported_url;
 use crate::tree::SyntaxNode;
@@ -120,18 +120,18 @@ use crate::v1::expr::ExprEvaluator;
 use crate::v1::write_json_file;
 
 /// The default container requirement.
-pub const DEFAULT_TASK_REQUIREMENT_CONTAINER: &str = "ubuntu:latest";
+const DEFAULT_TASK_REQUIREMENT_CONTAINER: &str = "ubuntu:latest";
 /// The default value for the `cpu` requirement.
-pub const DEFAULT_TASK_REQUIREMENT_CPU: f64 = 1.0;
+const DEFAULT_TASK_REQUIREMENT_CPU: f64 = 1.0;
 /// The default value for the `memory` requirement.
-pub const DEFAULT_TASK_REQUIREMENT_MEMORY: i64 = 2 * (ONE_GIBIBYTE as i64);
+const DEFAULT_TASK_REQUIREMENT_MEMORY: i64 = 2 * (ONE_GIBIBYTE as i64);
 /// The default value for the `max_retries` requirement.
-pub const DEFAULT_TASK_REQUIREMENT_MAX_RETRIES: u64 = 0;
+const DEFAULT_TASK_REQUIREMENT_MAX_RETRIES: u64 = 0;
 /// The default value for the `disks` requirement (in GiB).
-pub const DEFAULT_TASK_REQUIREMENT_DISKS: f64 = 1.0;
+pub(crate) const DEFAULT_TASK_REQUIREMENT_DISKS: f64 = 1.0;
 /// The default GPU count when a GPU is required but no supported hint is
 /// provided.
-pub const DEFAULT_GPU_COUNT: u64 = 1;
+const DEFAULT_GPU_COUNT: u64 = 1;
 
 /// The index of a task's root scope.
 const ROOT_SCOPE_INDEX: ScopeIndex = ScopeIndex::new(0);
@@ -317,7 +317,8 @@ pub(crate) fn gpu(
 ///
 /// Disk types are specified via hints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum DiskType {
+#[allow(clippy::upper_case_acronyms)]
+pub(crate) enum DiskType {
     /// The disk type is a solid state drive.
     SSD,
     /// The disk type is a hard disk drive.
@@ -337,11 +338,12 @@ impl FromStr for DiskType {
 }
 
 /// Represents a task disk requirement.
-pub struct DiskRequirement {
+pub(crate) struct DiskRequirement {
     /// The size of the disk, in GiB.
     pub size: i64,
 
     /// The disk type as specified by a corresponding task hint.
+    #[expect(unused, reason = "may be needed by backends in the future")]
     pub ty: Option<DiskType>,
 }
 
@@ -687,8 +689,8 @@ impl EvaluationContext for TaskEvaluationContext<'_, '_> {
 
 /// Represents task evaluation state.
 struct State<'a> {
-    /// The top-level evaluation context.
-    top_level: &'a TopLevelEvaluator,
+    /// The top-level evaluator.
+    evaluator: &'a Evaluator,
     /// The temp directory.
     temp_dir: &'a Path,
     /// The base directory for evaluation.
@@ -725,12 +727,12 @@ struct State<'a> {
 impl<'a> State<'a> {
     /// Get the [`Transferer`] for this evaluation.
     fn transferer(&self) -> &Arc<dyn Transferer> {
-        &self.top_level.transferer
+        &self.evaluator.transferer
     }
 
     /// Constructs a new task evaluation state.
     fn new(
-        top_level: &'a TopLevelEvaluator,
+        evaluator: &'a Evaluator,
         document: &'a Document,
         task: &'a Task,
         temp_dir: &'a Path,
@@ -749,7 +751,7 @@ impl<'a> State<'a> {
             Scope::new(OUTPUT_SCOPE_INDEX),
         ];
 
-        let backend_inputs = if let Some(guest_inputs_dir) = top_level.backend.guest_inputs_dir() {
+        let backend_inputs = if let Some(guest_inputs_dir) = evaluator.backend.guest_inputs_dir() {
             InputTrie::new_with_guest_dir(guest_inputs_dir)
         } else {
             InputTrie::new()
@@ -764,7 +766,7 @@ impl<'a> State<'a> {
         })?;
 
         Ok(Self {
-            top_level,
+            evaluator,
             temp_dir,
             base_dir,
             document,
@@ -828,7 +830,7 @@ impl<'a> State<'a> {
                 // Check to see if there's no guest path for a remote URL that needs to be
                 // localized; if so, we must localize it now
                 if needs_local_inputs
-                    && self.backend_inputs.as_slice()[index].guest_path.is_none()
+                    && self.backend_inputs.as_slice()[index].guest_path().is_none()
                     && is_supported_url(path.as_str())
                     && !is_file_url(path.as_str())
                 {
@@ -897,7 +899,7 @@ impl<'a> State<'a> {
         {
             // If the input has a guest path, map it
             let input = &self.backend_inputs.as_slice()[index];
-            if let Some(guest_path) = &input.guest_path {
+            if let Some(guest_path) = input.guest_path() {
                 self.path_map.insert(path.clone(), guest_path.clone());
             }
 
@@ -918,7 +920,7 @@ struct EvaluatedSections {
     hints: Arc<HashMap<String, Value>>,
 }
 
-impl TopLevelEvaluator {
+impl Evaluator {
     /// Evaluates the given task.
     ///
     /// Upon success, returns the evaluated task.
@@ -926,8 +928,8 @@ impl TopLevelEvaluator {
         &self,
         document: &Document,
         task: &Task,
-        inputs: &TaskInputs,
-        task_eval_root: impl AsRef<Path>,
+        inputs: TaskInputs,
+        eval_root_dir: impl AsRef<Path>,
     ) -> EvaluationResult<EvaluatedTask> {
         // We cannot evaluate a document with errors
         if document.has_errors() {
@@ -935,7 +937,7 @@ impl TopLevelEvaluator {
         }
 
         let result = self
-            .perform_task_evaluation(document, task, inputs, task_eval_root.as_ref(), task.name())
+            .perform_task_evaluation(document, task, inputs, eval_root_dir.as_ref(), task.name())
             .await;
 
         if self.cancellation.user_canceled() {
@@ -953,8 +955,8 @@ impl TopLevelEvaluator {
         &self,
         document: &Document,
         task: &Task,
-        inputs: &TaskInputs,
-        task_eval_root: &Path,
+        inputs: TaskInputs,
+        eval_root_dir: &Path,
         id: &str,
     ) -> EvaluationResult<EvaluatedTask> {
         inputs.validate(document, task, None).with_context(|| {
@@ -996,10 +998,10 @@ impl TopLevelEvaluator {
             "evaluating task"
         );
 
-        let task_eval_root = absolute(task_eval_root).with_context(|| {
+        let task_eval_root = absolute(eval_root_dir).with_context(|| {
             format!(
                 "failed to determine absolute path of `{path}`",
-                path = task_eval_root.display()
+                path = eval_root_dir.display()
             )
         })?;
 
@@ -1013,7 +1015,7 @@ impl TopLevelEvaluator {
         })?;
 
         // Write the inputs to the task's root directory
-        write_json_file(task_eval_root.join(INPUTS_FILE), inputs)?;
+        write_json_file(task_eval_root.join(INPUTS_FILE), &inputs)?;
 
         let mut state = State::new(self, document, task, &temp_dir)?;
         let nodes = toposort(&graph, None).expect("graph should be acyclic");
@@ -1022,7 +1024,7 @@ impl TopLevelEvaluator {
             match &graph[nodes[current]] {
                 TaskGraphNode::Input(decl) => {
                     state
-                        .evaluate_input(id, decl, inputs)
+                        .evaluate_input(id, decl, &inputs)
                         .await
                         .map_err(|d| EvaluationError::new(state.document.clone(), d))?;
                 }
@@ -1063,7 +1065,13 @@ impl TopLevelEvaluator {
                 requirements,
                 hints,
             } = state
-                .evaluate_sections(id, &definition, inputs, attempt, previous_task_data.clone())
+                .evaluate_sections(
+                    id,
+                    &definition,
+                    &inputs,
+                    attempt,
+                    previous_task_data.clone(),
+                )
                 .await?;
 
             // Get the maximum number of retries, either from the task's requirements or
@@ -1219,9 +1227,7 @@ impl TopLevelEvaluator {
                             env.clone(),
                             self.transferer.clone(),
                         ),
-                        attempt,
                         attempt_dir.clone(),
-                        task_eval_root.clone(),
                         temp_dir.clone(),
                     );
 
@@ -1445,7 +1451,7 @@ impl<'a> State<'a> {
             decl_ty.is_optional(),
             &mut value,
             self.transferer().clone(),
-            self.top_level.backend.needs_local_inputs(),
+            self.evaluator.backend.needs_local_inputs(),
         )
         .await
         .map_err(|e| {
@@ -1506,7 +1512,7 @@ impl<'a> State<'a> {
             decl_ty.is_optional(),
             &mut value,
             self.transferer().clone(),
-            self.top_level.backend.needs_local_inputs(),
+            self.evaluator.backend.needs_local_inputs(),
         )
         .await
         .map_err(|e| {
@@ -1866,7 +1872,7 @@ impl<'a> State<'a> {
         if version >= Some(SupportedVersion::V1(V1::Two)) {
             // Get the execution constraints
             let constraints = self
-                .top_level
+                .evaluator
                 .backend
                 .constraints(&requirements, &hints)
                 .with_context(|| {
@@ -1876,7 +1882,7 @@ impl<'a> State<'a> {
                     )
                 })?;
 
-            let max_retries = max_retries(&requirements, &self.top_level.config)?;
+            let max_retries = max_retries(&requirements, &self.evaluator.config)?;
 
             let mut task = TaskPostEvaluationValue::new(
                 self.task.name(),
@@ -1968,24 +1974,23 @@ impl<'a> State<'a> {
                 Some(self.transferer().as_ref()),
                 &|path| {
                     // Join the path with the work directory.
-                    let mut output_path = evaluated.result.work_dir.join(path.as_str())?;
+                    let output_path = evaluated.result.work_dir.join(path.as_str())?;
 
-                    // Ensure the output's path is valid
-                    let output_path = match (&mut output_path, &evaluated.result.work_dir) {
-                        (EvaluationPath::Local(joined), EvaluationPath::Local(base))
-                            if joined.starts_with(base)
-                                || joined == evaluated.stdout().as_file().unwrap().as_str()
-                                || joined == evaluated.stderr().as_file().unwrap().as_str() =>
+                    let output_path = if let (Some(joined), Some(base)) =
+                        (output_path.as_local(), evaluated.result.work_dir.as_local())
+                    {
+                        if joined.starts_with(base)
+                            || joined == evaluated.stdout().as_file().unwrap().as_str()
+                            || joined == evaluated.stderr().as_file().unwrap().as_str()
                         {
                             // The joined path is contained within the work directory or is
                             // stdout/stderr
                             HostPath::new(String::try_from(output_path)?)
-                        }
-                        (EvaluationPath::Local(_), EvaluationPath::Local(_)) => {
-                            // The joined path is not within the work or attempt directory;
-                            // therefore, it is required to be an input
+                        } else {
+                            // The joined path is not within the work directory, it must be a known
+                            // guest path
                             self.path_map
-                                .get_by_left(path)
+                                .get_by_right(&GuestPath(path.0.clone()))
                                 .ok_or_else(|| {
                                     anyhow!(
                                         "guest path `{path}` is not an input or within the task's \
@@ -1996,15 +2001,14 @@ impl<'a> State<'a> {
                                 .clone()
                                 .into()
                         }
-                        (EvaluationPath::Local(_), EvaluationPath::Remote(_)) => {
-                            // Path is local (and absolute) and the working directory is remote
-                            bail!(
-                                "cannot access guest path `{path}` from a remotely executing task"
-                            )
-                        }
-                        (EvaluationPath::Remote(_), _) => {
-                            HostPath::new(String::try_from(output_path)?)
-                        }
+                    } else if let (Some(_), Some(_)) = (
+                        output_path.as_local(),
+                        evaluated.result.work_dir.as_remote(),
+                    ) {
+                        // Path is local (and absolute) and the working directory is remote
+                        bail!("cannot access guest path `{path}` from a remotely executing task")
+                    } else {
+                        HostPath::new(String::try_from(output_path)?)
                     };
 
                     Ok(output_path)
@@ -2031,7 +2035,7 @@ impl<'a> State<'a> {
     /// Returns the inputs to pass to the backend.
     async fn localize_inputs(&mut self, task_id: &str) -> EvaluationResult<Vec<Input>> {
         // If the backend needs local inputs, download them now
-        if self.top_level.backend.needs_local_inputs() {
+        if self.evaluator.backend.needs_local_inputs() {
             let mut downloads = JoinSet::new();
 
             // Download any necessary files
@@ -2040,8 +2044,8 @@ impl<'a> State<'a> {
                     continue;
                 }
 
-                if let EvaluationPath::Remote(url) = input.path() {
-                    let transferer = self.top_level.transferer.clone();
+                if let Some(url) = input.path().as_remote() {
+                    let transferer = self.evaluator.transferer.clone();
                     let url = url.clone();
                     downloads.spawn(async move {
                         transferer
@@ -2085,7 +2089,7 @@ impl<'a> State<'a> {
                             task_name = self.task.name(),
                             document = self.document.uri().as_str(),
                             "task input `{path}` mapped to `{guest_path}`",
-                            path = input.path().display(),
+                            path = input.path(),
                         );
                     }
                     // Input is remote and was downloaded to a local path
@@ -2095,7 +2099,7 @@ impl<'a> State<'a> {
                             task_name = self.task.name(),
                             document = self.document.uri().as_str(),
                             "task input `{path}` downloaded to `{local_path}`",
-                            path = input.path().display(),
+                            path = input.path(),
                             local_path = local_path.display()
                         );
                     }
@@ -2106,7 +2110,7 @@ impl<'a> State<'a> {
                             task_name = self.task.name(),
                             document = self.document.uri().as_str(),
                             "task input `{path}` mapped to `{guest_path}`",
-                            path = input.path().display(),
+                            path = input.path(),
                         );
                     }
                     // Input is remote and was both downloaded and mapped to a guest path
@@ -2117,7 +2121,7 @@ impl<'a> State<'a> {
                             document = self.document.uri().as_str(),
                             "task input `{path}` downloaded to `{local_path}` and mapped to \
                              `{guest_path}`",
-                            path = input.path().display(),
+                            path = input.path(),
                             local_path = local_path.display(),
                         );
                     }
@@ -2187,13 +2191,13 @@ mod test {
     use wdl_analysis::DiagnosticsConfig;
 
     use crate::CancellationContext;
-    use crate::EvaluatedTask;
     use crate::Events;
     use crate::TaskInputs;
     use crate::config::BackendConfig;
     use crate::config::CallCachingMode;
     use crate::config::Config;
-    use crate::v1::TopLevelEvaluator;
+    use crate::eval::EvaluatedTask;
+    use crate::v1::Evaluator;
 
     /// Helper for evaluating a simple task with the given call cache mode.
     async fn evaluate_task(mode: CallCachingMode, root_dir: &Path, source: &str) -> EvaluatedTask {
@@ -2223,7 +2227,7 @@ mod test {
             .backends
             .insert("default".into(), BackendConfig::Local(Default::default()));
 
-        let evaluator = TopLevelEvaluator::new(
+        let evaluator = Evaluator::new(
             &root_dir.join("runs"),
             config,
             CancellationContext::default(),
@@ -2237,7 +2241,7 @@ mod test {
             .evaluate_task(
                 document,
                 document.task_by_name("test").expect("should have task"),
-                &TaskInputs::default(),
+                TaskInputs::default(),
                 &runs_dir,
             )
             .await

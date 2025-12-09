@@ -120,7 +120,7 @@ use crate::tree::SyntaxToken;
 
 /// Represents a WDL V1 expression evaluator.
 #[derive(Debug)]
-pub struct ExprEvaluator<C> {
+pub(crate) struct ExprEvaluator<C> {
     /// The expression evaluation context.
     context: C,
     /// The nested count of placeholder evaluation.
@@ -537,7 +537,7 @@ impl<C: EvaluationContext> ExprEvaluator<C> {
         };
 
         Ok(
-            Array::new(Some(&self.context), ArrayType::new(element_ty), values)
+            Array::new_with_context(Some(&self.context), ArrayType::new(element_ty), values)
                 .expect("array elements should coerce")
                 .into(),
         )
@@ -551,7 +551,7 @@ impl<C: EvaluationContext> ExprEvaluator<C> {
         let (left, right) = expr.exprs();
         let left = self.evaluate_expr(&left).await?;
         let right = self.evaluate_expr(&right).await?;
-        Ok(Pair::new(
+        Ok(Pair::new_with_context(
             Some(&self.context),
             PairType::new(left.ty(), right.ty()),
             left,
@@ -665,7 +665,7 @@ impl<C: EvaluationContext> ExprEvaluator<C> {
             None => (Type::Union, Type::Union, Vec::new()),
         };
 
-        Ok(Map::new(
+        Ok(Map::new_with_context(
             Some(&self.context),
             MapType::new(key_ty, value_ty),
             elements,
@@ -1518,14 +1518,14 @@ pub(crate) mod test {
     use wdl_grammar::lexer::Lexer;
 
     use super::*;
-    use crate::ScopeRef;
+    use crate::EvaluationPath;
     use crate::eval::Scope;
+    use crate::eval::ScopeRef;
     use crate::http::Location;
     use crate::http::Transferer;
-    use crate::path::EvaluationPath;
 
     /// Represents a test environment.
-    pub struct TestEnv {
+    pub(crate) struct TestEnv {
         /// The scopes for the test.
         scopes: Vec<Scope>,
         /// The structs for the test.
@@ -1539,7 +1539,7 @@ pub(crate) mod test {
     }
 
     impl TestEnv {
-        pub fn scope(&self) -> ScopeRef<'_> {
+        fn scope(&self) -> ScopeRef<'_> {
             ScopeRef::new(&self.scopes, 0)
         }
 
@@ -1567,7 +1567,7 @@ pub(crate) mod test {
     impl Default for TestEnv {
         fn default() -> Self {
             let test_dir = TempDir::new().expect("failed to create test directory");
-            let base_dir = EvaluationPath::Local(test_dir.path().to_path_buf());
+            let base_dir = test_dir.path().into();
 
             Self {
                 scopes: vec![Scope::default()],
@@ -3364,11 +3364,10 @@ pub(crate) mod test {
         let array_ty = ArrayType::new(PrimitiveType::Integer);
         let map_ty = MapType::new(PrimitiveType::String, PrimitiveType::Integer);
 
-        env.insert_name("foo", Array::new(None, array_ty, [1, 2, 3, 4, 5]).unwrap());
+        env.insert_name("foo", Array::new(array_ty, [1, 2, 3, 4, 5]).unwrap());
         env.insert_name(
             "bar",
             Map::new(
-                None,
                 map_ty,
                 [
                     (PrimitiveValue::new_string("foo"), 1),
@@ -3446,12 +3445,11 @@ pub(crate) mod test {
 
         env.insert_name(
             "foo",
-            Pair::new(None, pair_ty, 1, PrimitiveValue::new_string("foo")).unwrap(),
+            Pair::new(pair_ty, 1, PrimitiveValue::new_string("foo")).unwrap(),
         );
         env.insert_name(
             "bar",
             Struct::new(
-                None,
                 struct_ty,
                 [
                     ("foo", 1.into()),
