@@ -16,20 +16,19 @@ use crankshaft::engine::service::name::UniqueAlphanumeric;
 use crankshaft::events::Event;
 use crankshaft::events::next_task_id;
 use crankshaft::events::send_event;
+use futures::FutureExt;
+use futures::future::BoxFuture;
 use nonempty::NonEmpty;
 use tokio::process::Command;
 use tokio::select;
 use tokio::sync::broadcast;
 use tokio::sync::oneshot;
-use tokio::sync::oneshot::Receiver;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 use tracing::warn;
 
 use super::TaskExecutionBackend;
 use super::TaskExecutionConstraints;
-use super::TaskManager;
-use super::TaskManagerRequest;
 use super::TaskSpawnRequest;
 use crate::EvaluationPath;
 use crate::ONE_GIBIBYTE;
@@ -42,11 +41,13 @@ use crate::backend::STDERR_FILE_NAME;
 use crate::backend::STDOUT_FILE_NAME;
 use crate::backend::TaskExecutionResult;
 use crate::backend::WORK_DIR_NAME;
+use crate::backend::manager::TaskManager;
+use crate::backend::manager::TaskManagerRequest;
 use crate::config::Config;
 use crate::config::DEFAULT_TASK_SHELL;
-use crate::config::LocalBackendConfig;
 use crate::config::TaskResourceLimitBehavior;
 use crate::convert_unit_string;
+use crate::http::Transferer;
 use crate::v1::cpu;
 use crate::v1::memory;
 
@@ -62,14 +63,6 @@ struct LocalTaskRequest {
     inner: TaskSpawnRequest,
     /// The name of the task.
     name: String,
-    /// The requested CPU reservation for the task.
-    ///
-    /// Note that CPU isn't actually reserved for the task process.
-    cpu: f64,
-    /// The requested memory reservation for the task.
-    ///
-    /// Note that memory isn't actually reserved for the task process.
-    memory: u64,
     /// The cancellation token for the request.
     token: CancellationToken,
     /// The sender for events.
@@ -78,11 +71,11 @@ struct LocalTaskRequest {
 
 impl TaskManagerRequest for LocalTaskRequest {
     fn cpu(&self) -> f64 {
-        self.cpu
+        self.inner.constraints().cpu
     }
 
     fn memory(&self) -> u64 {
-        self.memory
+        self.inner.constraints().memory
     }
 
     async fn run(self) -> Result<TaskExecutionResult> {
@@ -254,11 +247,7 @@ impl LocalBackend {
     /// configuration.
     ///
     /// The provided configuration is expected to have already been validated.
-    pub fn new(
-        config: Arc<Config>,
-        backend_config: &LocalBackendConfig,
-        events: Option<broadcast::Sender<Event>>,
-    ) -> Result<Self> {
+    pub fn new(config: Arc<Config>, events: Option<broadcast::Sender<Event>>) -> Result<Self> {
         info!("initializing local backend");
 
         let names = Arc::new(Mutex::new(GeneratorIterator::new(
@@ -266,6 +255,10 @@ impl LocalBackend {
             INITIAL_EXPECTED_NAMES,
         )));
 
+        let backend_config = config.backend()?;
+        let backend_config = backend_config
+            .as_local()
+            .context("configured backend is not local")?;
         let cpu = backend_config
             .cpu
             .unwrap_or_else(|| SYSTEM.cpus().len() as u64);
@@ -288,10 +281,6 @@ impl LocalBackend {
 }
 
 impl TaskExecutionBackend for LocalBackend {
-    fn max_concurrency(&self) -> u64 {
-        self.cpu
-    }
-
     fn constraints(
         &self,
         requirements: &HashMap<String, Value>,
@@ -325,7 +314,7 @@ impl TaskExecutionBackend for LocalBackend {
             }
         }
 
-        let mut memory = memory(requirements)?;
+        let mut memory = memory(requirements)? as u64;
         if self.memory < memory as u64 {
             let env_specific = if self.config.suppress_env_specific_output {
                 String::new()
@@ -343,7 +332,7 @@ impl TaskExecutionBackend for LocalBackend {
                         memory = memory as f64 / ONE_GIBIBYTE,
                     );
                     // clamp the reported constraint to what's available
-                    memory = self.memory.try_into().unwrap_or(i64::MAX);
+                    memory = self.memory;
                 }
                 TaskResourceLimitBehavior::Deny => {
                     bail!(
@@ -370,51 +359,41 @@ impl TaskExecutionBackend for LocalBackend {
         None
     }
 
-    fn needs_local_inputs(&self) -> bool {
-        true
-    }
-
     fn spawn(
         &self,
         request: TaskSpawnRequest,
+        _transferer: Arc<dyn Transferer>,
         token: CancellationToken,
-    ) -> Result<Receiver<Result<TaskExecutionResult>>> {
-        let (completed_tx, completed_rx) = oneshot::channel();
+    ) -> BoxFuture<'_, Result<TaskExecutionResult>> {
+        async move {
+            let (completed_tx, completed_rx) = oneshot::channel();
 
-        let requirements = request.requirements();
-        let mut cpu = cpu(requirements);
-        if let TaskResourceLimitBehavior::TryWithMax = self.config.task.cpu_limit_behavior {
-            cpu = std::cmp::min(cpu.ceil() as u64, self.cpu) as f64;
+            let name = format!(
+                "{id}-{generated}",
+                id = request.id(),
+                generated = self
+                    .names
+                    .lock()
+                    .expect("generator should always acquire")
+                    .next()
+                    .expect("generator should never be exhausted")
+            );
+
+            self.manager.send(
+                LocalTaskRequest {
+                    config: self.config.clone(),
+                    inner: request,
+                    name,
+                    token,
+                    events: self.events.clone(),
+                },
+                completed_tx,
+            );
+
+            completed_rx
+                .await
+                .context("failed to receive execution result")?
         }
-        let mut memory = memory(requirements)? as u64;
-        if let TaskResourceLimitBehavior::TryWithMax = self.config.task.memory_limit_behavior {
-            memory = std::cmp::min(memory, self.memory);
-        }
-
-        let name = format!(
-            "{id}-{generated}",
-            id = request.id(),
-            generated = self
-                .names
-                .lock()
-                .expect("generator should always acquire")
-                .next()
-                .expect("generator should never be exhausted")
-        );
-
-        self.manager.send(
-            LocalTaskRequest {
-                config: self.config.clone(),
-                inner: request,
-                name,
-                cpu,
-                memory,
-                token,
-                events: self.events.clone(),
-            },
-            completed_tx,
-        );
-
-        Ok(completed_rx)
+        .boxed()
     }
 }

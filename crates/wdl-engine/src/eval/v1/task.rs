@@ -100,6 +100,7 @@ use crate::TaskPostEvaluationValue;
 use crate::TaskPreEvaluationValue;
 use crate::Value;
 use crate::backend::Input;
+use crate::backend::TaskExecutionConstraints;
 use crate::backend::TaskExecutionResult;
 use crate::backend::TaskSpawnInfo;
 use crate::backend::TaskSpawnRequest;
@@ -950,6 +951,8 @@ struct EvaluatedSections {
     requirements: Arc<HashMap<String, Value>>,
     /// The evaluated hints.
     hints: Arc<HashMap<String, Value>>,
+    /// The task's execution constraints.
+    constraints: TaskExecutionConstraints,
 }
 
 impl Evaluator {
@@ -1104,6 +1107,7 @@ impl Evaluator {
                 command,
                 requirements,
                 hints,
+                constraints,
             } = state
                 .evaluate_sections(
                     id,
@@ -1265,23 +1269,15 @@ impl Evaluator {
                             requirements.clone(),
                             hints.clone(),
                             env.clone(),
-                            self.transferer.clone(),
                         ),
+                        constraints,
                         attempt_dir.clone(),
                         temp_dir.clone(),
                     );
 
                     self.backend
-                        .spawn(request, self.cancellation.token())
-                        .with_context(|| {
-                            format!(
-                                "failed to spawn task `{name}` in `{path}` (task id `{id}`)",
-                                name = task.name(),
-                                path = document.path(),
-                            )
-                        })?
+                        .spawn(request, self.transferer.clone(), self.cancellation.token())
                         .await
-                        .expect("failed to receive response from spawned task")
                         .map_err(|e| {
                             EvaluationError::new(
                                 state.document.clone(),
@@ -1989,28 +1985,28 @@ impl<'a> State<'a> {
             ),
         };
 
+        // Get the execution constraints
+        let constraints = self
+            .evaluator
+            .backend
+            .constraints(&requirements, &hints)
+            .with_context(|| {
+                format!(
+                    "failed to get constraints for task `{task}`",
+                    task = self.task.name()
+                )
+            })?;
+
         // Now that those are evaluated, insert a [`TaskPostEvaluation`] for
         // `task` which includes those calculated requirements before the
         // command/output sections are evaluated.
         if version >= Some(SupportedVersion::V1(V1::Two)) {
-            // Get the execution constraints
-            let constraints = self
-                .evaluator
-                .backend
-                .constraints(&requirements, &hints)
-                .with_context(|| {
-                    format!(
-                        "failed to get constraints for task `{task}`",
-                        task = self.task.name()
-                    )
-                })?;
-
             let max_retries = max_retries(&requirements, &self.evaluator.config)?;
 
             let mut task = TaskPostEvaluationValue::new(
                 self.task.name(),
                 id,
-                constraints,
+                &constraints,
                 max_retries.try_into().with_context(|| {
                     format!(
                         "the number of max retries is too large to run task `{task}`",
@@ -2055,6 +2051,7 @@ impl<'a> State<'a> {
             command,
             requirements: Arc::new(requirements),
             hints: Arc::new(hints),
+            constraints,
         })
     }
 
