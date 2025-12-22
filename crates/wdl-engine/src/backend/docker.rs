@@ -22,10 +22,11 @@ use crankshaft::engine::task::input::Contents;
 use crankshaft::engine::task::input::Type as InputType;
 use crankshaft::engine::task::output::Type as OutputType;
 use crankshaft::events::Event;
+use futures::FutureExt;
+use futures::future::BoxFuture;
 use nonempty::NonEmpty;
 use tokio::sync::broadcast;
 use tokio::sync::oneshot;
-use tokio::sync::oneshot::Receiver;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 use tracing::warn;
@@ -48,17 +49,14 @@ use crate::backend::STDOUT_FILE_NAME;
 use crate::backend::WORK_DIR_NAME;
 use crate::config::Config;
 use crate::config::DEFAULT_TASK_SHELL;
-use crate::config::DockerBackendConfig;
 use crate::config::TaskResourceLimitBehavior;
+use crate::http::Transferer;
 use crate::v1::container;
 use crate::v1::cpu;
 use crate::v1::gpu;
 use crate::v1::max_cpu;
 use crate::v1::max_memory;
 use crate::v1::memory;
-
-/// The root guest path for inputs.
-const GUEST_INPUTS_DIR: &str = "/mnt/task/inputs/";
 
 /// The guest working directory.
 const GUEST_WORK_DIR: &str = "/mnt/task/work";
@@ -84,12 +82,6 @@ struct DockerTaskRequest {
     backend: Arc<docker::Backend>,
     /// The name of the task.
     name: String,
-    /// The requested container for the task.
-    container: String,
-    /// The requested CPU reservation for the task.
-    cpu: f64,
-    /// The requested memory reservation for the task, in bytes.
-    memory: u64,
     /// The requested maximum CPU limit for the task.
     max_cpu: Option<f64>,
     /// The requested maximum memory limit for the task, in bytes.
@@ -102,11 +94,11 @@ struct DockerTaskRequest {
 
 impl TaskManagerRequest for DockerTaskRequest {
     fn cpu(&self) -> f64 {
-        self.cpu
+        self.inner.constraints().cpu
     }
 
     fn memory(&self) -> u64 {
-        self.memory
+        self.inner.constraints().memory
     }
 
     async fn run(self) -> Result<TaskExecutionResult> {
@@ -207,10 +199,16 @@ impl TaskManagerRequest for DockerTaskRequest {
         ];
 
         let task = Task::builder()
-            .name(self.name)
+            .name(&self.name)
             .executions(NonEmpty::new(
                 Execution::builder()
-                    .image(self.container)
+                    .image(
+                        self.inner
+                            .constraints()
+                            .container
+                            .as_ref()
+                            .expect("must have container"),
+                    )
                     .program(
                         self.config
                             .task
@@ -229,9 +227,9 @@ impl TaskManagerRequest for DockerTaskRequest {
             .outputs(outputs)
             .resources(
                 Resources::builder()
-                    .cpu(self.cpu)
+                    .cpu(self.cpu())
                     .maybe_cpu_limit(self.max_cpu)
-                    .ram(self.memory as f64 / ONE_GIBIBYTE)
+                    .ram(self.memory() as f64 / ONE_GIBIBYTE)
                     .maybe_ram_limit(self.max_memory.map(|m| m as f64 / ONE_GIBIBYTE))
                     .maybe_gpu(self.gpu)
                     .build(),
@@ -270,8 +268,6 @@ pub struct DockerBackend {
     config: Arc<Config>,
     /// The underlying Crankshaft backend.
     inner: Arc<docker::Backend>,
-    /// The maximum amount of concurrency supported.
-    max_concurrency: u64,
     /// The maximum CPUs for any of one node.
     max_cpu: u64,
     /// The maximum memory for any of one node.
@@ -289,7 +285,6 @@ impl DockerBackend {
     /// The provided configuration is expected to have already been validated.
     pub async fn new(
         config: Arc<Config>,
-        backend_config: &DockerBackendConfig,
         events: Option<broadcast::Sender<Event>>,
     ) -> Result<Self> {
         info!("initializing Docker backend");
@@ -298,6 +293,11 @@ impl DockerBackend {
             UniqueAlphanumeric::default_with_expected_generations(INITIAL_EXPECTED_NAMES),
             INITIAL_EXPECTED_NAMES,
         )));
+
+        let backend_config = config.backend()?;
+        let backend_config = backend_config
+            .as_docker()
+            .context("configured backend is not Docker")?;
 
         let backend = docker::Backend::initialize_default_with(
             backend::docker::Config::builder()
@@ -327,7 +327,6 @@ impl DockerBackend {
         Ok(Self {
             config,
             inner: Arc::new(backend),
-            max_concurrency: cpu,
             max_cpu,
             max_memory,
             manager,
@@ -337,10 +336,6 @@ impl DockerBackend {
 }
 
 impl TaskExecutionBackend for DockerBackend {
-    fn max_concurrency(&self) -> u64 {
-        self.max_concurrency
-    }
-
     fn constraints(
         &self,
         requirements: &HashMap<String, Value>,
@@ -376,7 +371,7 @@ impl TaskExecutionBackend for DockerBackend {
             }
         }
 
-        let mut memory = memory(requirements)?;
+        let mut memory = memory(requirements)? as u64;
         if self.max_memory < memory as u64 {
             let env_specific = if self.config.suppress_env_specific_output {
                 String::new()
@@ -394,7 +389,7 @@ impl TaskExecutionBackend for DockerBackend {
                         memory = memory as f64 / ONE_GIBIBYTE,
                     );
                     // clamp the reported constraint to what's available
-                    memory = self.max_memory.try_into().unwrap_or(i64::MAX);
+                    memory = self.max_memory;
                 }
                 TaskResourceLimitBehavior::Deny => {
                     bail!(
@@ -425,65 +420,48 @@ impl TaskExecutionBackend for DockerBackend {
         })
     }
 
-    fn guest_inputs_dir(&self) -> Option<&'static str> {
-        Some(GUEST_INPUTS_DIR)
-    }
-
-    fn needs_local_inputs(&self) -> bool {
-        true
-    }
-
     fn spawn(
         &self,
         request: TaskSpawnRequest,
+        _transferer: Arc<dyn Transferer>,
         token: CancellationToken,
-    ) -> Result<Receiver<Result<TaskExecutionResult>>> {
-        let (completed_tx, completed_rx) = oneshot::channel();
+    ) -> BoxFuture<'_, Result<TaskExecutionResult>> {
+        async move {
+            let (completed_tx, completed_rx) = oneshot::channel();
 
-        let requirements = request.requirements();
-        let hints = request.hints();
+            let max_cpu = max_cpu(request.hints());
+            let max_memory = max_memory(request.hints())?.map(|i| i as u64);
+            let gpu = gpu(request.requirements(), request.hints());
 
-        let container = container(requirements, self.config.task.container.as_deref()).into_owned();
-        let mut cpu = cpu(requirements);
-        if let TaskResourceLimitBehavior::TryWithMax = self.config.task.cpu_limit_behavior {
-            cpu = std::cmp::min(cpu.ceil() as u64, self.max_cpu) as f64;
+            let name = format!(
+                "{id}-{generated}",
+                id = request.id(),
+                generated = self
+                    .names
+                    .lock()
+                    .expect("generator should always acquire")
+                    .next()
+                    .expect("generator should never be exhausted")
+            );
+            self.manager.send(
+                DockerTaskRequest {
+                    config: self.config.clone(),
+                    inner: request,
+                    backend: self.inner.clone(),
+                    name,
+                    max_cpu,
+                    max_memory,
+                    gpu,
+                    token,
+                },
+                completed_tx,
+            );
+
+            completed_rx
+                .await
+                .context("failed to receive execution result")?
         }
-        let mut memory = memory(requirements)? as u64;
-        if let TaskResourceLimitBehavior::TryWithMax = self.config.task.memory_limit_behavior {
-            memory = std::cmp::min(memory, self.max_memory);
-        }
-        let max_cpu = max_cpu(hints);
-        let max_memory = max_memory(hints)?.map(|i| i as u64);
-        let gpu = gpu(requirements, hints);
-
-        let name = format!(
-            "{id}-{generated}",
-            id = request.id(),
-            generated = self
-                .names
-                .lock()
-                .expect("generator should always acquire")
-                .next()
-                .expect("generator should never be exhausted")
-        );
-        self.manager.send(
-            DockerTaskRequest {
-                config: self.config.clone(),
-                inner: request,
-                backend: self.inner.clone(),
-                name,
-                container,
-                cpu,
-                memory,
-                max_cpu,
-                max_memory,
-                gpu,
-                token,
-            },
-            completed_tx,
-        );
-
-        Ok(completed_rx)
+        .boxed()
     }
 
     #[cfg(unix)]

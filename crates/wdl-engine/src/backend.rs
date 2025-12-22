@@ -2,7 +2,6 @@
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::fmt;
 use std::future::Future;
 use std::ops::Add;
 use std::ops::Range;
@@ -18,7 +17,6 @@ use indexmap::IndexMap;
 use ordered_float::OrderedFloat;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
-use tokio::sync::oneshot::Receiver;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
@@ -43,6 +41,9 @@ pub use local::*;
 pub use lsf_apptainer::*;
 pub use slurm_apptainer::*;
 pub use tes::*;
+
+/// The default root guest path for inputs.
+const GUEST_INPUTS_DIR: &str = "/mnt/task/inputs/";
 
 /// The default work directory name.
 pub(crate) const WORK_DIR_NAME: &str = "work";
@@ -125,6 +126,7 @@ impl Input {
 }
 
 /// Represents constraints applied to a task's execution.
+#[derive(Debug)]
 pub struct TaskExecutionConstraints {
     /// The container the task will run in.
     ///
@@ -133,7 +135,7 @@ pub struct TaskExecutionConstraints {
     /// The allocated number of CPUs; must be greater than 0.
     pub cpu: f64,
     /// The allocated memory in bytes; must be greater than 0.
-    pub memory: i64,
+    pub memory: u64,
     /// A list with one specification per allocated GPU.
     ///
     /// The specification is execution engine-specific.
@@ -161,6 +163,7 @@ pub struct TaskExecutionConstraints {
 }
 
 /// Represents information for spawning a task.
+#[derive(Debug)]
 pub(crate) struct TaskSpawnInfo {
     /// The command of the task.
     command: String,
@@ -172,8 +175,6 @@ pub(crate) struct TaskSpawnInfo {
     hints: Arc<HashMap<String, Value>>,
     /// The environment variables of the task.
     env: Arc<IndexMap<String, String>>,
-    /// The transferer to use for uploading inputs.
-    transferer: Arc<dyn Transferer>,
 }
 
 impl TaskSpawnInfo {
@@ -184,7 +185,6 @@ impl TaskSpawnInfo {
         requirements: Arc<HashMap<String, Value>>,
         hints: Arc<HashMap<String, Value>>,
         env: Arc<IndexMap<String, String>>,
-        transferer: Arc<dyn Transferer>,
     ) -> Self {
         Self {
             command,
@@ -192,21 +192,7 @@ impl TaskSpawnInfo {
             requirements,
             hints,
             env,
-            transferer,
         }
-    }
-}
-
-impl fmt::Debug for TaskSpawnInfo {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("TaskSpawnInfo")
-            .field("command", &self.command)
-            .field("inputs", &self.inputs)
-            .field("requirements", &self.requirements)
-            .field("hints", &self.hints)
-            .field("env", &self.env)
-            .field("transferer", &"<transferer>")
-            .finish()
     }
 }
 
@@ -217,6 +203,8 @@ pub(crate) struct TaskSpawnRequest {
     id: String,
     /// The information for the task to spawn.
     info: TaskSpawnInfo,
+    /// The constraints for the task's execution.
+    constraints: TaskExecutionConstraints,
     /// The attempt directory for the task's execution.
     attempt_dir: PathBuf,
     /// The temp directory for the evaluation.
@@ -225,10 +213,17 @@ pub(crate) struct TaskSpawnRequest {
 
 impl TaskSpawnRequest {
     /// Creates a new task spawn request.
-    pub fn new(id: String, info: TaskSpawnInfo, attempt_dir: PathBuf, temp_dir: PathBuf) -> Self {
+    pub fn new(
+        id: String,
+        info: TaskSpawnInfo,
+        constraints: TaskExecutionConstraints,
+        attempt_dir: PathBuf,
+        temp_dir: PathBuf,
+    ) -> Self {
         Self {
             id,
             info,
+            constraints,
             attempt_dir,
             temp_dir,
         }
@@ -264,9 +259,9 @@ impl TaskSpawnRequest {
         &self.info.env
     }
 
-    /// Gets the transferer to use for uploading inputs.
-    pub fn transferer(&self) -> &Arc<dyn Transferer> {
-        &self.info.transferer
+    /// Gets the constraints to apply to the task's execution.
+    pub fn constraints(&self) -> &TaskExecutionConstraints {
+        &self.constraints
     }
 
     /// Gets the attempt directory for the task's execution.
@@ -279,26 +274,29 @@ impl TaskSpawnRequest {
         &self.temp_dir
     }
 
-    /// The default host-side location of the script generated from the task
-    /// `command`.
-    pub fn wdl_command_host_path(&self) -> PathBuf {
+    /// The host path for the command to store the task's evaluated command.
+    pub fn command_path(&self) -> PathBuf {
         self.attempt_dir.join(COMMAND_FILE_NAME)
     }
 
-    /// The default host-side location of the task's working directory.
-    pub fn wdl_work_dir_host_path(&self) -> PathBuf {
+    /// The default work directory host path.
+    ///
+    /// This is used by backends that support local or shared file systems.
+    pub fn work_dir(&self) -> PathBuf {
         self.attempt_dir.join(WORK_DIR_NAME)
     }
 
-    /// The default host-side location where the `command`'s stdout will be
-    /// written.
-    pub fn wdl_stdout_host_path(&self) -> PathBuf {
+    /// The default stdout file host path.
+    ///
+    /// This is used by backends that support local or shared file systems.
+    pub fn stdout_path(&self) -> PathBuf {
         self.attempt_dir.join(STDOUT_FILE_NAME)
     }
 
-    /// The default host-side location where the `command`'s stderr will be
-    /// written.
-    pub fn wdl_stderr_host_path(&self) -> PathBuf {
+    /// The default stderr file host path.
+    ///
+    /// This is used by backends that support local or shared file systems.
+    pub fn stderr_path(&self) -> PathBuf {
         self.attempt_dir.join(STDERR_FILE_NAME)
     }
 }
@@ -318,10 +316,10 @@ pub struct TaskExecutionResult {
 
 /// Represents a task execution backend.
 pub(crate) trait TaskExecutionBackend: Send + Sync {
-    /// Gets the maximum concurrent tasks supported by the backend.
-    fn max_concurrency(&self) -> u64;
-
     /// Gets the execution constraints given a task's requirements and hints.
+    ///
+    /// The returned constraints are used to populate the `task` variable in WDL
+    /// 1.2+.
     ///
     /// Returns an error if the task cannot be constrained for the execution
     /// environment or if the task specifies invalid requirements.
@@ -336,22 +334,26 @@ pub(crate) trait TaskExecutionBackend: Send + Sync {
     /// Returns `None` if the backend does not execute tasks in a container.
     ///
     /// The returned path is expected to be Unix style and end with a backslash.
-    fn guest_inputs_dir(&self) -> Option<&'static str>;
+    fn guest_inputs_dir(&self) -> Option<&'static str> {
+        Some(GUEST_INPUTS_DIR)
+    }
 
     /// Determines if the backend needs local inputs.
     ///
-    /// Backends that run tasks locally or from a shared file system will return
-    /// `true`.
-    fn needs_local_inputs(&self) -> bool;
+    /// Backends that run tasks remotely should return `false`.
+    fn needs_local_inputs(&self) -> bool {
+        true
+    }
 
     /// Spawns a task with the execution backend.
     ///
-    /// Returns a oneshot receiver for awaiting the completion of the task.
+    /// Returns the result of the task execution.
     fn spawn(
         &self,
         request: TaskSpawnRequest,
+        transferer: Arc<dyn Transferer>,
         token: CancellationToken,
-    ) -> Result<Receiver<Result<TaskExecutionResult>>>;
+    ) -> BoxFuture<'_, Result<TaskExecutionResult>>;
 
     /// Performs cleanup operations after task execution completes.
     ///
@@ -421,6 +423,9 @@ impl<Req> TaskManagerState<Req> {
 }
 
 /// Responsible for managing tasks based on available host resources.
+///
+/// The task manager is utilized by backends that need to directly schedule
+/// tasks, such as the local backend and the Docker backend when not in a swarm.
 #[derive(Debug)]
 struct TaskManager<Req> {
     /// The sender for new spawn requests.
