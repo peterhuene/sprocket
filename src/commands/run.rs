@@ -755,6 +755,8 @@ async fn progress(
 
                             continue
                         }
+                        // TODO: remove prior to merging
+                        CrankshaftEvent::TaskResourceUsage { .. } |
                         CrankshaftEvent::TaskContainerCreated { .. }
                         | CrankshaftEvent::TaskContainerExited { .. }
                         | CrankshaftEvent::TaskStdout { .. }
@@ -944,25 +946,22 @@ pub async fn run(
                 progress_bar.pb_set_style(&style);
             })
         })
-        .progress({
+        .progress(move |kind, completed, total| {
             let progress_bar = progress_bar.clone();
-            move |kind, completed, total| {
-                let progress_bar = progress_bar.clone();
-                async move {
-                    if start.elapsed() < PROGRESS_BAR_DELAY_BEFORE_RENDER {
-                        return;
-                    }
-
-                    if completed == 0 {
-                        progress_bar.pb_start();
-                        progress_bar.pb_set_length(total.try_into().unwrap());
-                        progress_bar.pb_set_message(&format!("{kind}"));
-                    }
-
-                    progress_bar.pb_set_position(completed.try_into().unwrap());
+            async move {
+                if start.elapsed() < PROGRESS_BAR_DELAY_BEFORE_RENDER {
+                    return;
                 }
-                .boxed()
+
+                if completed == 0 {
+                    progress_bar.pb_start();
+                    progress_bar.pb_set_length(total.try_into().unwrap());
+                    progress_bar.pb_set_message(&format!("{kind}"));
+                }
+
+                progress_bar.pb_set_position(completed.try_into().unwrap());
             }
+            .boxed()
         })
         .modules_config(config.modules.clone())
         .feature_flags(config.common.wdl.feature_flags)
@@ -1010,10 +1009,18 @@ pub async fn run(
     let (ctx, run_dir, db, _heartbeat) =
         setup_run_context(handle, &args, &config, &source, &target, &inputs).await?;
 
+    if args.disable_retries {
+        config.run.engine.task.retries = RetryConfig::Disabled;
+    }
+
+    let uses_docker = uses_docker_backend(&config.run.engine);
     let cancellation = CancellationContext::new(config.run.engine.failure_mode);
+    let engine = Engine::new(config.run.engine)
+        .await
+        .context("failed to create WDL evaluation engine")?;
+
     // Determined here as the engine configuration is moved into evaluation
     // below.
-    let uses_docker = uses_docker_backend(&config.run.engine);
     let events = Events::new(
         config
             .run
@@ -1028,8 +1035,9 @@ pub async fn run(
         colorize,
         cancellation.second().clone(),
     ));
+
     let crankshaft_progress = tokio::spawn(progress(
-        progress_bar,
+        tracing::span!(Level::WARN, "progress"),
         args.show_task_stderr,
         colorize,
         target.clone(),
@@ -1047,14 +1055,6 @@ pub async fn run(
     // CWD as a placeholder.
     let cwd = std::env::current_dir().context("failed to get current working directory")?;
     let base_dir = EvaluationPath::from(cwd.as_path());
-
-    if args.disable_retries {
-        config.run.engine.task.retries = RetryConfig::Disabled;
-    }
-
-    let engine = Engine::new(config.run.engine)
-        .await
-        .context("failed to create WDL evaluation engine")?;
 
     let mut execute = Box::pin(execute_target(
         db.clone(),

@@ -29,6 +29,7 @@ libc = { workspace = true }
 lru = { workspace = true }
 nonempty = { workspace = true }
 num_enum = { workspace = true }
+opener = { workspace = true }
 ordered-float = { workspace = true }
 path-clean = { workspace = true }
 petgraph = { workspace = true }
@@ -44,12 +45,14 @@ serde_yaml_ng = { workspace = true }
 shellexpand = { workspace = true }
 sysinfo = { workspace = true }
 tempfile = { workspace = true }
+tes = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-retry2 = { workspace = true }
 tokio-util = { workspace = true }
 toml-spanner = { workspace = true }
 tracing = { workspace = true }
+tracing-indicatif = { workspace = true }
 url = { workspace = true }
 walkdir = { workspace = true }
 wdl-analysis = { version = "0.26.0", path = "../wdl-analysis" }
