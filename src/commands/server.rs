@@ -10,6 +10,8 @@ use anyhow::Context;
 use clap::Parser;
 use clap::Subcommand;
 use wdl::diagnostics::Mode;
+use wdl::engine::config::BackendConfig;
+use wdl::engine::config::TesBackendAuthConfig;
 
 use crate::Config;
 use crate::commands::CommandResult;
@@ -109,6 +111,16 @@ impl StartArgs {
             .server
             .allowed_origins
             .append(&mut self.allowed_origins);
+
+        // Force OAuth to require a refresh token as the server is not
+        // interactive
+        for (_, config) in &mut config.server.engine.backends {
+            if let BackendConfig::Tes { config } = config
+                && let Some(TesBackendAuthConfig::OAuth { config }) = &mut config.auth
+            {
+                config.require_refresh = true;
+            }
+        }
     }
 }
 
