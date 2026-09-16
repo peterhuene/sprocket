@@ -34,6 +34,7 @@ mod eval;
 mod http;
 mod inputs;
 mod lock;
+mod oauth;
 mod outputs;
 mod path;
 mod stdlib;

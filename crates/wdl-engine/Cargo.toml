@@ -29,6 +29,8 @@ libc = { workspace = true }
 lru = { workspace = true }
 nonempty = { workspace = true }
 num_enum = { workspace = true }
+oauth2 = { workspace = true }
+opener = { workspace = true }
 ordered-float = { workspace = true }
 path-clean = { workspace = true }
 petgraph = { workspace = true }

@@ -50,6 +50,7 @@ use crate::config::Config;
 use crate::config::ContentDigestMode;
 use crate::config::TesBackendAuthConfig;
 use crate::digest::UrlDigestExt;
+use crate::oauth::perform_oauth_device_flow;
 use crate::v1::DEFAULT_DISK_MOUNT_POINT;
 use crate::v1::DEFAULT_TASK_REQUIREMENT_DISKS;
 use crate::v1::hints;
@@ -105,6 +106,11 @@ impl TesBackend {
                     token: config.token.inner().expose_secret().to_string(),
                 });
             }
+            Some(TesBackendAuthConfig::OAuth { config }) => {
+                let (access_token, refresh_token) = perform_oauth_device_flow(config).await?;
+                dbg!(access_token);
+                dbg!(refresh_token);
+            }
             None => {}
         }
 
@@ -118,7 +124,7 @@ impl TesBackend {
 
         let inner = tes::Backend::initialize(
             backend::tes::Config::builder()
-                .url(backend_config.url.clone().expect("should have URL"))
+                .url(backend_config.service.clone())
                 .http(http)
                 .interval(backend_config.interval.unwrap_or(DEFAULT_TES_INTERVAL))
                 .build(),
@@ -217,12 +223,7 @@ impl TaskExecutionBackend for TesBackend {
 
             // SAFETY: currently `inputs` is required by configuration
             // validation, so it should always unwrap
-            let inputs_url = Arc::new(
-                backend_config
-                    .inputs
-                    .clone()
-                    .expect("should have inputs URL"),
-            );
+            let inputs_url = Arc::new(backend_config.inputs.clone());
 
             // Start with the command file as an input
             let mut backend_inputs = vec![
@@ -338,8 +339,6 @@ impl TaskExecutionBackend for TesBackend {
             // validation, so it should always unwrap
             let outputs_url = backend_config
                 .outputs
-                .as_ref()
-                .expect("should have outputs URL")
                 .join(&output_dir)
                 .expect("should join");
 
